@@ -15,8 +15,7 @@ let contactsAgreed = new Set();
 let notified = false;
 
 client.once('ready', () => {
-  console.log(`ALIVE online as ${client.user.tag}`);
-  setInterval(checkAlive, 60 * 1000);
+  console.log(`ALIVE bot logged in as ${client.user.tag}`);
 });
 
 async function checkAlive() {
