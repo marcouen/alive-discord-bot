@@ -1,0 +1,5 @@
+app = "alive-discord-bot"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
