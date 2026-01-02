@@ -640,8 +640,14 @@ async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(BOT_TOKEN);
 
   if (GUILD_ID) {
-    await rest.put(Routes.applicationGuildCommands(APP_ID, GUILD_ID), { body: commands });
-    console.log("Slash commands registered (GUILD).");
+   try {
+  await rest.put(Routes.applicationGuildCommands(appId, guildId), { body: commands });
+  console.log("Slash commands registered.");
+} catch (e) {
+  console.error("Slash command register failed:", e?.rawError || e?.message || e);
+  // IMPORTANT: do NOT crash the app; bot can still run without re-registering
+}
+
   } else {
     await rest.put(Routes.applicationCommands(APP_ID), { body: commands });
     console.log("Slash commands registered (GLOBAL).");
