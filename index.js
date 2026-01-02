@@ -21,6 +21,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN env var");
 
 // ===== Discord client (minimal intents) =====
+// Slash commands 不需要 GuildMessages intent
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
   partials: [Partials.Channel],
@@ -32,37 +33,74 @@ const commands = [
     .setName("alive")
     .setDescription("ALIVE - low-intrusion check-in")
     .addSubcommand((s) =>
-      s.setName("setup").setDescription("Create/Update your settings")
-        .addStringOption(o => o.setName("schedule").setDescription("daily | weekly | random").setRequired(true))
-        .addStringOption(o => o.setName("time").setDescription("HH:mm (for daily/weekly)").setRequired(false))
-        .addIntegerOption(o => o.setName("weekday").setDescription("0=Sun..6=Sat (for weekly)").setRequired(false))
-        .addStringOption(o => o.setName("timezone").setDescription("IANA tz e.g. Asia/Taipei").setRequired(false))
-        .addStringOption(o => o.setName("quiet_start").setDescription("HH:mm").setRequired(false))
-        .addStringOption(o => o.setName("quiet_end").setDescription("HH:mm").setRequired(false))
-        .addIntegerOption(o => o.setName("retry_gap").setDescription("30 or 120 or 1440 (minutes)").setRequired(false))
+      s
+        .setName("setup")
+        .setDescription("Create/Update your settings")
+        .addStringOption((o) =>
+          o
+            .setName("schedule")
+            .setDescription("daily | weekly | random")
+            .setRequired(true)
+        )
+        .addStringOption((o) =>
+          o
+            .setName("time")
+            .setDescription("HH:mm (for daily/weekly)")
+            .setRequired(false)
+        )
+        .addIntegerOption((o) =>
+          o
+            .setName("weekday")
+            .setDescription("0=Sun..6=Sat (for weekly)")
+            .setRequired(false)
+        )
+        .addStringOption((o) =>
+          o
+            .setName("timezone")
+            .setDescription("IANA tz e.g. Asia/Taipei")
+            .setRequired(false)
+        )
+        .addStringOption((o) =>
+          o.setName("quiet_start").setDescription("HH:mm").setRequired(false)
+        )
+        .addStringOption((o) =>
+          o.setName("quiet_end").setDescription("HH:mm").setRequired(false)
+        )
+        .addIntegerOption((o) =>
+          o
+            .setName("retry_gap")
+            .setDescription("30 or 120 or 1440 (minutes)")
+            .setRequired(false)
+        )
     )
     .addSubcommand((s) =>
-      s.setName("add_contact").setDescription("Add a contact (max 3)")
-        .addUserOption(o => o.setName("user").setDescription("Contact user").setRequired(true))
+      s
+        .setName("add_contact")
+        .setDescription("Add a contact (max 3)")
+        .addUserOption((o) =>
+          o.setName("user").setDescription("Contact user").setRequired(true)
+        )
     )
     .addSubcommand((s) =>
-      s.setName("remove_contact").setDescription("Remove a contact")
-        .addUserOption(o => o.setName("user").setDescription("Contact user").setRequired(true))
+      s
+        .setName("remove_contact")
+        .setDescription("Remove a contact")
+        .addUserOption((o) =>
+          o.setName("user").setDescription("Contact user").setRequired(true)
+        )
     )
+    .addSubcommand((s) => s.setName("start").setDescription("Start ALIVE reminders"))
+    .addSubcommand((s) => s.setName("pause").setDescription("Pause ALIVE reminders"))
+    .addSubcommand((s) => s.setName("status").setDescription("Show your current status"))
     .addSubcommand((s) =>
-      s.setName("start").setDescription("Start ALIVE reminders")
-    )
-    .addSubcommand((s) =>
-      s.setName("pause").setDescription("Pause ALIVE reminders")
-    )
-    .addSubcommand((s) =>
-      s.setName("status").setDescription("Show your current status")
-    )
-    .addSubcommand((s) =>
-      s.setName("consent").setDescription("Contact consents to receive alerts")
-        .addStringOption(o => o.setName("code").setDescription("Consent code from DM").setRequired(true))
+      s
+        .setName("consent")
+        .setDescription("Contact consents to receive alerts")
+        .addStringOption((o) =>
+          o.setName("code").setDescription("Consent code from DM").setRequired(true)
+        )
     ),
-].map(c => c.toJSON());
+].map((c) => c.toJSON());
 
 // ===== Helpers =====
 function parseHHmm(hhmm) {
@@ -72,26 +110,21 @@ function parseHHmm(hhmm) {
 }
 
 function inQuietHours(dt, quietStart, quietEnd) {
-  // dt: luxon DateTime in user's tz
   const [sh, sm] = quietStart.split(":").map(Number);
   const [eh, em] = quietEnd.split(":").map(Number);
   const t = dt.hour * 60 + dt.minute;
   const s = sh * 60 + sm;
   const e = eh * 60 + em;
 
-  // quiet window may wrap overnight
   if (s <= e) return t >= s && t < e;
   return t >= s || t < e;
 }
 
 function nextAllowedTime(dt, quietStart, quietEnd) {
-  // if inside quiet hours, jump to quietEnd today or tomorrow
   if (!inQuietHours(dt, quietStart, quietEnd)) return dt;
 
   const [eh, em] = quietEnd.split(":").map(Number);
   let candidate = dt.set({ hour: eh, minute: em, second: 0, millisecond: 0 });
-
-  // if quiet wraps and quietEnd is "morning", candidate might be earlier today
   if (candidate <= dt) candidate = candidate.plus({ days: 1 });
   return candidate;
 }
@@ -115,26 +148,23 @@ function computeNextReminder(userRow) {
     if (target <= now) target = target.plus({ days: 1 });
   } else if (schedule === "weekly") {
     const [h, m] = dailyTime.split(":").map(Number);
-    // luxon: weekday 1=Mon..7=Sun ; we use 0=Sun..6=Sat
-    const want = weekday === 0 ? 7 : weekday;
+    const want = weekday === 0 ? 7 : weekday; // 0=Sun..6=Sat -> Luxon 7=Sun
     const today = now.weekday; // 1..7
     let diff = (want - today + 7) % 7;
-    target = now.plus({ days: diff }).set({ hour: h, minute: m, second: 0, millisecond: 0 });
+    target = now
+      .plus({ days: diff })
+      .set({ hour: h, minute: m, second: 0, millisecond: 0 });
     if (target <= now) target = target.plus({ days: 7 });
   } else {
-    // random daily: choose random time between 09:00-21:00, avoiding quiet
     const start = now.set({ hour: 9, minute: 0, second: 0, millisecond: 0 });
     let base = start;
     if (start <= now) base = start.plus({ days: 1 });
 
-    const randMin = Math.floor(Math.random() * (12 * 60)); // 0..719
+    const randMin = Math.floor(Math.random() * (12 * 60)); // 0..719 (09:00~21:00)
     target = base.plus({ minutes: randMin });
-
-    // if random lands in quiet hours, push to next allowed time
     target = nextAllowedTime(target, quietStart, quietEnd);
   }
 
-  // Ensure not in quiet hours
   target = nextAllowedTime(target, quietStart, quietEnd);
   return target.toUTC();
 }
@@ -151,7 +181,10 @@ async function ensureUser(userId) {
 }
 
 async function contactCount(ownerId) {
-  const { rows } = await q(`SELECT COUNT(*)::int AS c FROM contacts WHERE owner_user_id=$1`, [ownerId]);
+  const { rows } = await q(
+    `SELECT COUNT(*)::int AS c FROM contacts WHERE owner_user_id=$1`,
+    [ownerId]
+  );
   return rows[0].c;
 }
 
@@ -173,31 +206,62 @@ function reminderButtons(ownerId) {
   );
 }
 
+// 允許使用者貼：
+// - "hsgPLLtTp-"（純 code）
+// - "code:hsgPLLtTp-"（含前綴）
+// - "/alive consent code:hsg..."（整句複製）
+// 最後都會萃取出真正 code
+function normalizeConsentCode(input) {
+  if (!input) return "";
+  const s = String(input).trim();
+
+  // 找 "code:XXXX" 或 "code=XXXX"
+  const m = s.match(/code\s*[:=]\s*([A-Za-z0-9_-]{6,})/i);
+  if (m && m[1]) return m[1].trim();
+
+  // 否則就取第一段像 nanoid 的 token
+  const m2 = s.match(/([A-Za-z0-9_-]{6,})/);
+  return m2 ? m2[1].trim() : s;
+}
+
 // ===== Main: interactions =====
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isButton()) {
       const [key, ownerId] = interaction.customId.split(":");
+
       if (key === "alive_ok") {
-        await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'responded','button')`, [ownerId]);
+        await q(
+          `INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'responded','button')`,
+          [ownerId]
+        );
         await q(
           `UPDATE jobs SET retry_count=0, last_response_at=now(), next_at=$2
            WHERE owner_user_id=$1`,
           [ownerId, computeNextReminder(await ensureUser(ownerId)).toISO()]
         );
-        await interaction.reply({ content: "✅ Check-in recorded. Thank you.", ephemeral: true });
+        await interaction.reply({
+          content: "✅ Check-in recorded. Thank you.",
+          ephemeral: true,
+        });
         return;
       }
+
       if (key === "alive_later") {
-        // treat as response but schedule a short delay (10 minutes)
         const next = DateTime.now().plus({ minutes: 10 }).toUTC();
-        await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'responded','later')`, [ownerId]);
+        await q(
+          `INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'responded','later')`,
+          [ownerId]
+        );
         await q(
           `UPDATE jobs SET retry_count=0, last_response_at=now(), next_at=$2
            WHERE owner_user_id=$1`,
           [ownerId, next.toISO()]
         );
-        await interaction.reply({ content: "⏳ OK. I will ping you again in 10 minutes.", ephemeral: true });
+        await interaction.reply({
+          content: "⏳ OK. I will ping you again in 10 minutes.",
+          ephemeral: true,
+        });
         return;
       }
     }
@@ -208,7 +272,6 @@ client.on("interactionCreate", async (interaction) => {
     const sub = interaction.options.getSubcommand();
     const userId = interaction.user.id;
 
-    // Ensure user exists
     const userRow = await ensureUser(userId);
 
     if (sub === "setup") {
@@ -216,24 +279,42 @@ client.on("interactionCreate", async (interaction) => {
       const time = parseHHmm(interaction.options.getString("time"));
       const weekday = interaction.options.getInteger("weekday");
       const tz = interaction.options.getString("timezone") || userRow.tz || "Asia/Taipei";
-      const quietStart = parseHHmm(interaction.options.getString("quiet_start")) || userRow.quiet_start || "23:00";
-      const quietEnd = parseHHmm(interaction.options.getString("quiet_end")) || userRow.quiet_end || "07:00";
+      const quietStart =
+        parseHHmm(interaction.options.getString("quiet_start")) ||
+        userRow.quiet_start ||
+        "23:00";
+      const quietEnd =
+        parseHHmm(interaction.options.getString("quiet_end")) ||
+        userRow.quiet_end ||
+        "07:00";
       const retryGap = interaction.options.getInteger("retry_gap") || userRow.retry_gap_minutes || 30;
 
       if (!["daily", "weekly", "random"].includes(schedule)) {
-        await interaction.reply({ content: "schedule must be daily | weekly | random", ephemeral: true });
+        await interaction.reply({
+          content: "schedule must be daily | weekly | random",
+          ephemeral: true,
+        });
         return;
       }
       if ((schedule === "daily" || schedule === "weekly") && !time) {
-        await interaction.reply({ content: "For daily/weekly, you must provide time=HH:mm", ephemeral: true });
+        await interaction.reply({
+          content: "For daily/weekly, you must provide time=HH:mm",
+          ephemeral: true,
+        });
         return;
       }
       if (schedule === "weekly" && (weekday === null || weekday < 0 || weekday > 6)) {
-        await interaction.reply({ content: "For weekly, weekday must be 0..6", ephemeral: true });
+        await interaction.reply({
+          content: "For weekly, weekday must be 0..6",
+          ephemeral: true,
+        });
         return;
       }
       if (![30, 120, 1440].includes(retryGap)) {
-        await interaction.reply({ content: "retry_gap must be 30 or 120 or 1440 (minutes)", ephemeral: true });
+        await interaction.reply({
+          content: "retry_gap must be 30 or 120 or 1440 (minutes)",
+          ephemeral: true,
+        });
         return;
       }
 
@@ -265,26 +346,31 @@ client.on("interactionCreate", async (interaction) => {
 
       const count = await contactCount(userId);
       if (count >= 3) {
-        await interaction.reply({ content: "You already have 3 contacts (max). Remove one first.", ephemeral: true });
+        await interaction.reply({
+          content: "You already have 3 contacts (max). Remove one first.",
+          ephemeral: true,
+        });
         return;
       }
 
       const code = nanoid(10);
+
+      // 重要：更新 code 時，把 consented 重置成 false，避免舊狀態干擾
       await q(
         `INSERT INTO contacts(owner_user_id,contact_user_id,consent_code,consented)
          VALUES($1,$2,$3,false)
          ON CONFLICT (owner_user_id,contact_user_id)
-         DO UPDATE SET consent_code=$3`,
+         DO UPDATE SET consent_code=$3, consented=false`,
         [userId, contact.id, code]
       );
 
-      // Ask contact to consent in DM
       await dm(contact.id, {
         content:
           "ALIVE consent request:\n" +
-          `A user wants to add you as an emergency contact.\n\n` +
-          `If you agree, run this command in ANY server where ALIVE exists:\n` +
+          "A user wants to add you as an emergency contact.\n\n" +
+          "If you agree, run this command in ANY server where ALIVE exists:\n" +
           `**/alive consent code:${code}**\n\n` +
+          "Tip: You can paste either `code:XXXX` or just `XXXX`.\n" +
           "If you do not agree, ignore this message.",
       });
 
@@ -297,24 +383,57 @@ client.on("interactionCreate", async (interaction) => {
 
     if (sub === "remove_contact") {
       const contact = interaction.options.getUser("user");
-      await q(`DELETE FROM contacts WHERE owner_user_id=$1 AND contact_user_id=$2`, [userId, contact.id]);
-      await interaction.reply({ content: `✅ Removed contact: ${contact.username}`, ephemeral: true });
+      await q(`DELETE FROM contacts WHERE owner_user_id=$1 AND contact_user_id=$2`, [
+        userId,
+        contact.id,
+      ]);
+      await interaction.reply({
+        content: `✅ Removed contact: ${contact.username}`,
+        ephemeral: true,
+      });
       return;
     }
 
     if (sub === "consent") {
-      const code = interaction.options.getString("code");
+      // 先 defer，避免 Discord 3 秒超時造成「看起來沒回應」
+      await interaction.deferReply({ ephemeral: true });
+
+      const raw = interaction.options.getString("code");
+      const code = normalizeConsentCode(raw);
+
+      if (!code) {
+        await interaction.editReply("❌ Invalid code.");
+        return;
+      }
+
       const { rows } = await q(
-        `UPDATE contacts SET consented=true
+        `UPDATE contacts
+         SET consented=true
          WHERE contact_user_id=$1 AND consent_code=$2
          RETURNING owner_user_id`,
         [userId, code]
       );
+
       if (rows.length === 0) {
-        await interaction.reply({ content: "❌ Invalid code.", ephemeral: true });
+        await interaction.editReply(
+          "❌ Invalid code. (Tip: make sure you copied the whole code, including '-' if it exists.)"
+        );
         return;
       }
-      await interaction.reply({ content: "✅ Consent recorded. You may receive alerts in the future.", ephemeral: true });
+
+      const ownerId = rows[0].owner_user_id;
+
+      // 同時 DM 通知 owner：哪個 contact 已同意
+      try {
+        const contactUser = await client.users.fetch(userId);
+        await dm(ownerId, {
+          content: `✅ Consent accepted: **${contactUser.username}** agreed to be your emergency contact.`,
+        });
+      } catch (e) {
+        console.error("DM owner failed after consent", e?.message || e);
+      }
+
+      await interaction.editReply("✅ Consent recorded. You may receive alerts in the future.");
       return;
     }
 
@@ -323,7 +442,7 @@ client.on("interactionCreate", async (interaction) => {
         `SELECT contact_user_id, consented FROM contacts WHERE owner_user_id=$1`,
         [userId]
       );
-      const consented = contacts.filter(c => c.consented).length;
+      const consented = contacts.filter((c) => c.consented).length;
       if (consented === 0) {
         await interaction.reply({
           content: "⚠️ You must have at least 1 contact who has consented before starting.",
@@ -345,7 +464,10 @@ client.on("interactionCreate", async (interaction) => {
         [userId, next.toISO()]
       );
 
-      await interaction.reply({ content: `✅ ALIVE started. Next check-in scheduled.`, ephemeral: true });
+      await interaction.reply({
+        content: "✅ ALIVE started. Next check-in scheduled.",
+        ephemeral: true,
+      });
       return;
     }
 
@@ -372,7 +494,7 @@ client.on("interactionCreate", async (interaction) => {
           `- quiet: ${u.quiet_start} ~ ${u.quiet_end}\n` +
           `- retry: max 2, gap ${u.retry_gap_minutes}m\n` +
           `- next: ${job ? job.next_at : "(not scheduled)"}\n` +
-          `- contacts: ${contacts.length} (consented: ${contacts.filter(c => c.consented).length})\n`,
+          `- contacts: ${contacts.length} (consented: ${contacts.filter((c) => c.consented).length})\n`,
         ephemeral: true,
       });
       return;
@@ -380,8 +502,10 @@ client.on("interactionCreate", async (interaction) => {
   } catch (e) {
     console.error(e);
     try {
-      if (interaction && !interaction.replied) {
+      if (interaction && !interaction.replied && !interaction.deferred) {
         await interaction.reply({ content: "❌ Error. Check logs.", ephemeral: true });
+      } else if (interaction && interaction.deferred) {
+        await interaction.editReply("❌ Error. Check logs.");
       }
     } catch {}
   }
@@ -389,7 +513,7 @@ client.on("interactionCreate", async (interaction) => {
 
 // ===== Worker loop (poll DB every 60s) =====
 async function workerTick() {
-  // find active jobs due
+  // 1) send reminders for due jobs
   const { rows } = await q(
     `SELECT j.*, u.*
      FROM jobs j
@@ -400,9 +524,7 @@ async function workerTick() {
 
   for (const row of rows) {
     const ownerId = row.owner_user_id;
-    const tz = row.tz || "Asia/Taipei";
 
-    // Send reminder
     try {
       await dm(ownerId, {
         content:
@@ -412,60 +534,54 @@ async function workerTick() {
         components: [reminderButtons(ownerId)],
       });
 
-      await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'reminded','scheduled')`, [ownerId]);
+      await q(
+        `INSERT INTO checkins(owner_user_id,status,note)
+         VALUES($1,'reminded','scheduled')`,
+        [ownerId]
+      );
 
-      const retryCount = row.retry_count ?? 0;
-      const retryMax = row.retry_max ?? 2;
       const gap = row.retry_gap_minutes ?? 30;
-
-      // schedule next step:
-      // after sending a reminder, we wait "gap" minutes for response.
-      // If no response is registered, worker will treat the next tick as "timeout" and retry/escalate.
       const nextAt = DateTime.now().toUTC().plus({ minutes: gap });
 
       await q(
-        `UPDATE jobs SET last_reminded_at=now(), next_at=$2 WHERE owner_user_id=$1`,
+        `UPDATE jobs
+         SET last_reminded_at=now(), next_at=$2
+         WHERE owner_user_id=$1`,
         [ownerId, nextAt.toISO()]
       );
-
-      // Mark a "pending window" using retry_count semantics:
-      // Next tick will check if user responded since last_reminded_at.
     } catch (e) {
-      console.error("DM failed", ownerId, e.message);
-      // If DM fails, we still keep job; next tick will retry
+      console.error("DM failed", ownerId, e?.message || e);
     }
   }
 
-  // handle timeouts: if last_reminded_at exists and no response after that, escalate retry_count
+  // 2) handle timeouts / retries / escalation
   const { rows: pending } = await q(
     `SELECT j.*, u.*
      FROM jobs j
      JOIN users u ON u.user_id = j.owner_user_id
-     WHERE u.is_active=true AND j.next_at <= now()
+     WHERE u.is_active=true
        AND j.last_reminded_at IS NOT NULL
+       AND j.next_at <= now()
      LIMIT 50`
   );
 
   for (const row of pending) {
     const ownerId = row.owner_user_id;
 
-    // did user respond after last_reminded_at?
     const { rows: responded } = await q(
-      `SELECT 1 FROM checkins
-       WHERE owner_user_id=$1 AND status='responded' AND created_at >= $2
+      `SELECT 1
+       FROM checkins
+       WHERE owner_user_id=$1
+         AND status='responded'
+         AND created_at >= $2
        LIMIT 1`,
       [ownerId, row.last_reminded_at]
     );
 
-    if (responded.length > 0) {
-      // already handled by button path; reschedule next normal reminder
-      continue;
-    }
+    if (responded.length > 0) continue;
 
-    // timeout -> retry or escalate
     const retryCount = row.retry_count ?? 0;
     const retryMax = row.retry_max ?? 2;
-    const gap = row.retry_gap_minutes ?? 30;
 
     await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'timeout',$2)`, [
       ownerId,
@@ -473,12 +589,16 @@ async function workerTick() {
     ]);
 
     if (retryCount < retryMax) {
-      // retry: send another reminder immediately on next tick
-      await q(`UPDATE jobs SET retry_count=retry_count+1, next_at=now() WHERE owner_user_id=$1`, [ownerId]);
+      await q(
+        `UPDATE jobs
+         SET retry_count=retry_count+1, next_at=now()
+         WHERE owner_user_id=$1`,
+        [ownerId]
+      );
     } else {
-      // escalate: notify all consented contacts (Discord version = simultaneous)
       const { rows: contacts } = await q(
-        `SELECT contact_user_id FROM contacts
+        `SELECT contact_user_id
+         FROM contacts
          WHERE owner_user_id=$1 AND consented=true
          LIMIT 3`,
         [ownerId]
@@ -494,18 +614,23 @@ async function workerTick() {
               "If you can, please check on them.",
           });
         } catch (e) {
-          console.error("notify contact DM failed", c.contact_user_id, e.message);
+          console.error("notify contact DM failed", c.contact_user_id, e?.message || e);
         }
       }
 
-      await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'escalated','contacts_notified')`, [ownerId]);
+      await q(
+        `INSERT INTO checkins(owner_user_id,status,note)
+         VALUES($1,'escalated','contacts_notified')`,
+        [ownerId]
+      );
 
-      // Reset and schedule next normal reminder
       const userRow = await ensureUser(ownerId);
       const next = computeNextReminder(userRow);
 
       await q(
-        `UPDATE jobs SET retry_count=0, last_reminded_at=NULL, next_at=$2 WHERE owner_user_id=$1`,
+        `UPDATE jobs
+         SET retry_count=0, last_reminded_at=NULL, next_at=$2
+         WHERE owner_user_id=$1`,
         [ownerId, next.toISO()]
       );
     }
@@ -515,10 +640,9 @@ async function workerTick() {
 async function main() {
   await initDb();
 
-  // Register slash commands (global). First deploy may take some time to appear.
   const rest = new REST({ version: "10" }).setToken(BOT_TOKEN);
 
-  const appId = process.env.APP_ID; // optional
+  const appId = process.env.APP_ID;
   if (appId) {
     await rest.put(Routes.applicationCommands(appId), { body: commands });
     console.log("Slash commands registered.");
