@@ -10,9 +10,10 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
+  Events,
 } = require("discord.js");
 
-const { DateTime } = require("luxon");
+const { DateTime, IANAZone } = require("luxon");
 const { nanoid } = require("nanoid");
 const { q, initDb } = require("./db");
 
@@ -20,8 +21,12 @@ const { q, initDb } = require("./db");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN env var");
 
+const APP_ID = process.env.APP_ID || null;
+// 可選：為了讓 slash commands 立刻出現，建議設 GUILD_ID（你的測試伺服器 ID）
+const GUILD_ID = process.env.GUILD_ID || null;
+
 // ===== Discord client (minimal intents) =====
-// Slash commands 不需要 GuildMessages intent
+// 你只需要：Guilds + DirectMessages
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
   partials: [Partials.Channel],
@@ -105,8 +110,14 @@ const commands = [
 // ===== Helpers =====
 function parseHHmm(hhmm) {
   if (!hhmm) return null;
-  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(hhmm.trim());
-  return m ? hhmm.trim() : null;
+  const t = String(hhmm).trim();
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(t);
+  return m ? t : null;
+}
+
+function validTimezone(tz) {
+  if (!tz) return false;
+  return IANAZone.isValidZone(tz);
 }
 
 function inQuietHours(dt, quietStart, quietEnd) {
@@ -116,11 +127,13 @@ function inQuietHours(dt, quietStart, quietEnd) {
   const s = sh * 60 + sm;
   const e = eh * 60 + em;
 
+  // quiet window may wrap overnight
   if (s <= e) return t >= s && t < e;
   return t >= s || t < e;
 }
 
 function nextAllowedTime(dt, quietStart, quietEnd) {
+  if (!quietStart || !quietEnd) return dt;
   if (!inQuietHours(dt, quietStart, quietEnd)) return dt;
 
   const [eh, em] = quietEnd.split(":").map(Number);
@@ -148,20 +161,20 @@ function computeNextReminder(userRow) {
     if (target <= now) target = target.plus({ days: 1 });
   } else if (schedule === "weekly") {
     const [h, m] = dailyTime.split(":").map(Number);
-    const want = weekday === 0 ? 7 : weekday; // 0=Sun..6=Sat -> Luxon 7=Sun
+    // luxon weekday: 1=Mon..7=Sun ; we use 0=Sun..6=Sat
+    const want = weekday === 0 ? 7 : weekday;
     const today = now.weekday; // 1..7
     let diff = (want - today + 7) % 7;
-    target = now
-      .plus({ days: diff })
-      .set({ hour: h, minute: m, second: 0, millisecond: 0 });
+    target = now.plus({ days: diff }).set({ hour: h, minute: m, second: 0, millisecond: 0 });
     if (target <= now) target = target.plus({ days: 7 });
   } else {
-    const start = now.set({ hour: 9, minute: 0, second: 0, millisecond: 0 });
-    let base = start;
-    if (start <= now) base = start.plus({ days: 1 });
+    // random daily: 09:00-21:00
+    const base = now.set({ hour: 9, minute: 0, second: 0, millisecond: 0 });
+    let start = base;
+    if (start <= now) start = start.plus({ days: 1 });
 
-    const randMin = Math.floor(Math.random() * (12 * 60)); // 0..719 (09:00~21:00)
-    target = base.plus({ minutes: randMin });
+    const randMin = Math.floor(Math.random() * (12 * 60)); // 0..719
+    target = start.plus({ minutes: randMin });
     target = nextAllowedTime(target, quietStart, quietEnd);
   }
 
@@ -175,7 +188,6 @@ async function ensureUser(userId) {
      ON CONFLICT (user_id) DO NOTHING`,
     [userId]
   );
-
   const { rows } = await q(`SELECT * FROM users WHERE user_id=$1`, [userId]);
   return rows[0];
 }
@@ -206,27 +218,10 @@ function reminderButtons(ownerId) {
   );
 }
 
-// 允許使用者貼：
-// - "hsgPLLtTp-"（純 code）
-// - "code:hsgPLLtTp-"（含前綴）
-// - "/alive consent code:hsg..."（整句複製）
-// 最後都會萃取出真正 code
-function normalizeConsentCode(input) {
-  if (!input) return "";
-  const s = String(input).trim();
-
-  // 找 "code:XXXX" 或 "code=XXXX"
-  const m = s.match(/code\s*[:=]\s*([A-Za-z0-9_-]{6,})/i);
-  if (m && m[1]) return m[1].trim();
-
-  // 否則就取第一段像 nanoid 的 token
-  const m2 = s.match(/([A-Za-z0-9_-]{6,})/);
-  return m2 ? m2[1].trim() : s;
-}
-
-// ===== Main: interactions =====
+// ===== Interactions =====
 client.on("interactionCreate", async (interaction) => {
   try {
+    // ---- Buttons ----
     if (interaction.isButton()) {
       const [key, ownerId] = interaction.customId.split(":");
 
@@ -235,37 +230,48 @@ client.on("interactionCreate", async (interaction) => {
           `INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'responded','button')`,
           [ownerId]
         );
+
+        const u = await ensureUser(ownerId);
+        const next = computeNextReminder(u);
+
         await q(
-          `UPDATE jobs SET retry_count=0, last_response_at=now(), next_at=$2
+          `UPDATE jobs
+           SET retry_count=0,
+               last_response_at=now(),
+               last_reminded_at=NULL,
+               next_at=$2
            WHERE owner_user_id=$1`,
-          [ownerId, computeNextReminder(await ensureUser(ownerId)).toISO()]
+          [ownerId, next.toISO()]
         );
-        await interaction.reply({
-          content: "✅ Check-in recorded. Thank you.",
-          ephemeral: true,
-        });
+
+        await interaction.reply({ content: "✅ Check-in recorded. Thank you.", ephemeral: true });
         return;
       }
 
       if (key === "alive_later") {
-        const next = DateTime.now().plus({ minutes: 10 }).toUTC();
+        const next = DateTime.now().toUTC().plus({ minutes: 10 });
+
         await q(
           `INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'responded','later')`,
           [ownerId]
         );
+
         await q(
-          `UPDATE jobs SET retry_count=0, last_response_at=now(), next_at=$2
+          `UPDATE jobs
+           SET retry_count=0,
+               last_response_at=now(),
+               last_reminded_at=NULL,
+               next_at=$2
            WHERE owner_user_id=$1`,
           [ownerId, next.toISO()]
         );
-        await interaction.reply({
-          content: "⏳ OK. I will ping you again in 10 minutes.",
-          ephemeral: true,
-        });
+
+        await interaction.reply({ content: "⏳ OK. I will ping you again in 10 minutes.", ephemeral: true });
         return;
       }
     }
 
+    // ---- Slash commands ----
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName !== "alive") return;
 
@@ -278,7 +284,9 @@ client.on("interactionCreate", async (interaction) => {
       const schedule = interaction.options.getString("schedule");
       const time = parseHHmm(interaction.options.getString("time"));
       const weekday = interaction.options.getInteger("weekday");
-      const tz = interaction.options.getString("timezone") || userRow.tz || "Asia/Taipei";
+      const tzInput = interaction.options.getString("timezone");
+      const tz = validTimezone(tzInput) ? tzInput : (userRow.tz || "Asia/Taipei");
+
       const quietStart =
         parseHHmm(interaction.options.getString("quiet_start")) ||
         userRow.quiet_start ||
@@ -287,41 +295,36 @@ client.on("interactionCreate", async (interaction) => {
         parseHHmm(interaction.options.getString("quiet_end")) ||
         userRow.quiet_end ||
         "07:00";
+
       const retryGap = interaction.options.getInteger("retry_gap") || userRow.retry_gap_minutes || 30;
 
       if (!["daily", "weekly", "random"].includes(schedule)) {
-        await interaction.reply({
-          content: "schedule must be daily | weekly | random",
-          ephemeral: true,
-        });
+        await interaction.reply({ content: "schedule must be daily | weekly | random", ephemeral: true });
         return;
       }
       if ((schedule === "daily" || schedule === "weekly") && !time) {
-        await interaction.reply({
-          content: "For daily/weekly, you must provide time=HH:mm",
-          ephemeral: true,
-        });
+        await interaction.reply({ content: "For daily/weekly, you must provide time=HH:mm", ephemeral: true });
         return;
       }
       if (schedule === "weekly" && (weekday === null || weekday < 0 || weekday > 6)) {
-        await interaction.reply({
-          content: "For weekly, weekday must be 0..6",
-          ephemeral: true,
-        });
+        await interaction.reply({ content: "For weekly, weekday must be 0..6", ephemeral: true });
         return;
       }
       if (![30, 120, 1440].includes(retryGap)) {
-        await interaction.reply({
-          content: "retry_gap must be 30 or 120 or 1440 (minutes)",
-          ephemeral: true,
-        });
+        await interaction.reply({ content: "retry_gap must be 30 or 120 or 1440 (minutes)", ephemeral: true });
         return;
       }
 
       await q(
         `UPDATE users
-         SET schedule_type=$2, daily_time=$3, weekly_day=$4, tz=$5,
-             quiet_start=$6, quiet_end=$7, retry_gap_minutes=$8, updated_at=now()
+         SET schedule_type=$2,
+             daily_time=$3,
+             weekly_day=$4,
+             tz=$5,
+             quiet_start=$6,
+             quiet_end=$7,
+             retry_gap_minutes=$8,
+             updated_at=now()
          WHERE user_id=$1`,
         [userId, schedule, time, weekday, tz, quietStart, quietEnd, retryGap]
       );
@@ -354,8 +357,6 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       const code = nanoid(10);
-
-      // 重要：更新 code 時，把 consented 重置成 false，避免舊狀態干擾
       await q(
         `INSERT INTO contacts(owner_user_id,contact_user_id,consent_code,consented)
          VALUES($1,$2,$3,false)
@@ -370,7 +371,6 @@ client.on("interactionCreate", async (interaction) => {
           "A user wants to add you as an emergency contact.\n\n" +
           "If you agree, run this command in ANY server where ALIVE exists:\n" +
           `**/alive consent code:${code}**\n\n` +
-          "Tip: You can paste either `code:XXXX` or just `XXXX`.\n" +
           "If you do not agree, ignore this message.",
       });
 
@@ -383,28 +383,13 @@ client.on("interactionCreate", async (interaction) => {
 
     if (sub === "remove_contact") {
       const contact = interaction.options.getUser("user");
-      await q(`DELETE FROM contacts WHERE owner_user_id=$1 AND contact_user_id=$2`, [
-        userId,
-        contact.id,
-      ]);
-      await interaction.reply({
-        content: `✅ Removed contact: ${contact.username}`,
-        ephemeral: true,
-      });
+      await q(`DELETE FROM contacts WHERE owner_user_id=$1 AND contact_user_id=$2`, [userId, contact.id]);
+      await interaction.reply({ content: `✅ Removed contact: ${contact.username}`, ephemeral: true });
       return;
     }
 
     if (sub === "consent") {
-      // 先 defer，避免 Discord 3 秒超時造成「看起來沒回應」
-      await interaction.deferReply({ ephemeral: true });
-
-      const raw = interaction.options.getString("code");
-      const code = normalizeConsentCode(raw);
-
-      if (!code) {
-        await interaction.editReply("❌ Invalid code.");
-        return;
-      }
+      const code = interaction.options.getString("code");
 
       const { rows } = await q(
         `UPDATE contacts
@@ -415,25 +400,23 @@ client.on("interactionCreate", async (interaction) => {
       );
 
       if (rows.length === 0) {
-        await interaction.editReply(
-          "❌ Invalid code. (Tip: make sure you copied the whole code, including '-' if it exists.)"
-        );
+        await interaction.reply({ content: "❌ Invalid code.", ephemeral: true });
         return;
       }
 
       const ownerId = rows[0].owner_user_id;
 
-      // 同時 DM 通知 owner：哪個 contact 已同意
+      // DM owner: consent accepted
       try {
-        const contactUser = await client.users.fetch(userId);
         await dm(ownerId, {
-          content: `✅ Consent accepted: **${contactUser.username}** agreed to be your emergency contact.`,
+          content: `✅ Consent accepted: <@${userId}> agreed to be your emergency contact.`,
         });
-      } catch (e) {
-        console.error("DM owner failed after consent", e?.message || e);
-      }
+      } catch {}
 
-      await interaction.editReply("✅ Consent recorded. You may receive alerts in the future.");
+      await interaction.reply({
+        content: "✅ Consent recorded. You may receive alerts in the future.",
+        ephemeral: true,
+      });
       return;
     }
 
@@ -443,6 +426,7 @@ client.on("interactionCreate", async (interaction) => {
         [userId]
       );
       const consented = contacts.filter((c) => c.consented).length;
+
       if (consented === 0) {
         await interaction.reply({
           content: "⚠️ You must have at least 1 contact who has consented before starting.",
@@ -457,17 +441,14 @@ client.on("interactionCreate", async (interaction) => {
       const next = computeNextReminder(refreshed);
 
       await q(
-        `INSERT INTO jobs(owner_user_id,next_at,retry_count)
-         VALUES($1,$2,0)
+        `INSERT INTO jobs(owner_user_id,next_at,retry_count,retry_max,last_reminded_at)
+         VALUES($1,$2,0,2,NULL)
          ON CONFLICT (owner_user_id)
-         DO UPDATE SET next_at=$2, retry_count=0`,
+         DO UPDATE SET next_at=$2, retry_count=0, retry_max=2, last_reminded_at=NULL`,
         [userId, next.toISO()]
       );
 
-      await interaction.reply({
-        content: "✅ ALIVE started. Next check-in scheduled.",
-        ephemeral: true,
-      });
+      await interaction.reply({ content: "✅ ALIVE started. Next check-in scheduled.", ephemeral: true });
       return;
     }
 
@@ -502,10 +483,8 @@ client.on("interactionCreate", async (interaction) => {
   } catch (e) {
     console.error(e);
     try {
-      if (interaction && !interaction.replied && !interaction.deferred) {
+      if (interaction && !interaction.replied) {
         await interaction.reply({ content: "❌ Error. Check logs.", ephemeral: true });
-      } else if (interaction && interaction.deferred) {
-        await interaction.editReply("❌ Error. Check logs.");
       }
     } catch {}
   }
@@ -513,16 +492,18 @@ client.on("interactionCreate", async (interaction) => {
 
 // ===== Worker loop (poll DB every 60s) =====
 async function workerTick() {
-  // 1) send reminders for due jobs
-  const { rows } = await q(
+  // 1) Scheduled reminders (only jobs not currently waiting for response)
+  const { rows: due } = await q(
     `SELECT j.*, u.*
      FROM jobs j
      JOIN users u ON u.user_id = j.owner_user_id
-     WHERE u.is_active=true AND j.next_at <= now()
+     WHERE u.is_active=true
+       AND j.next_at <= now()
+       AND j.last_reminded_at IS NULL
      LIMIT 50`
   );
 
-  for (const row of rows) {
+  for (const row of due) {
     const ownerId = row.owner_user_id;
 
     try {
@@ -534,54 +515,56 @@ async function workerTick() {
         components: [reminderButtons(ownerId)],
       });
 
-      await q(
-        `INSERT INTO checkins(owner_user_id,status,note)
-         VALUES($1,'reminded','scheduled')`,
-        [ownerId]
-      );
+      await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'reminded','scheduled')`, [ownerId]);
 
       const gap = row.retry_gap_minutes ?? 30;
       const nextAt = DateTime.now().toUTC().plus({ minutes: gap });
 
+      // mark we are waiting for response window
       await q(
         `UPDATE jobs
-         SET last_reminded_at=now(), next_at=$2
+         SET last_reminded_at=now(),
+             next_at=$2
          WHERE owner_user_id=$1`,
         [ownerId, nextAt.toISO()]
       );
     } catch (e) {
-      console.error("DM failed", ownerId, e?.message || e);
+      console.error("DM failed", ownerId, e.message);
+      // keep job; will retry later
+      await q(`UPDATE jobs SET next_at=now() + interval '5 minutes' WHERE owner_user_id=$1`, [ownerId]);
     }
   }
 
-  // 2) handle timeouts / retries / escalation
+  // 2) Timeouts (jobs waiting for response window)
   const { rows: pending } = await q(
     `SELECT j.*, u.*
      FROM jobs j
      JOIN users u ON u.user_id = j.owner_user_id
      WHERE u.is_active=true
-       AND j.last_reminded_at IS NOT NULL
        AND j.next_at <= now()
+       AND j.last_reminded_at IS NOT NULL
      LIMIT 50`
   );
 
   for (const row of pending) {
     const ownerId = row.owner_user_id;
 
+    // did user respond after last_reminded_at?
     const { rows: responded } = await q(
-      `SELECT 1
-       FROM checkins
-       WHERE owner_user_id=$1
-         AND status='responded'
-         AND created_at >= $2
+      `SELECT 1 FROM checkins
+       WHERE owner_user_id=$1 AND status='responded' AND created_at >= $2
        LIMIT 1`,
       [ownerId, row.last_reminded_at]
     );
 
-    if (responded.length > 0) continue;
+    if (responded.length > 0) {
+      // button handler already scheduled next
+      continue;
+    }
 
     const retryCount = row.retry_count ?? 0;
     const retryMax = row.retry_max ?? 2;
+    const gap = row.retry_gap_minutes ?? 30;
 
     await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'timeout',$2)`, [
       ownerId,
@@ -589,13 +572,24 @@ async function workerTick() {
     ]);
 
     if (retryCount < retryMax) {
-      await q(
-        `UPDATE jobs
-         SET retry_count=retry_count+1, next_at=now()
-         WHERE owner_user_id=$1`,
-        [ownerId]
-      );
+      // retry: send another reminder now, but keep last_reminded_at for window tracking
+      await q(`UPDATE jobs SET retry_count=retry_count+1, last_reminded_at=now(), next_at=now() + ($2 || ' minutes')::interval WHERE owner_user_id=$1`, [
+        ownerId,
+        String(gap),
+      ]);
+
+      // Actually send the retry DM now
+      try {
+        await dm(ownerId, {
+          content: "Just checking again. Please tap a button so I know you’re OK.",
+          components: [reminderButtons(ownerId)],
+        });
+        await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'reminded','retry')`, [ownerId]);
+      } catch (e) {
+        console.error("retry DM failed", ownerId, e.message);
+      }
     } else {
+      // escalate: notify consented contacts (simultaneous)
       const { rows: contacts } = await q(
         `SELECT contact_user_id
          FROM contacts
@@ -614,22 +608,21 @@ async function workerTick() {
               "If you can, please check on them.",
           });
         } catch (e) {
-          console.error("notify contact DM failed", c.contact_user_id, e?.message || e);
+          console.error("notify contact DM failed", c.contact_user_id, e.message);
         }
       }
 
-      await q(
-        `INSERT INTO checkins(owner_user_id,status,note)
-         VALUES($1,'escalated','contacts_notified')`,
-        [ownerId]
-      );
+      await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'escalated','contacts_notified')`, [ownerId]);
 
-      const userRow = await ensureUser(ownerId);
-      const next = computeNextReminder(userRow);
+      // Reset and schedule next normal reminder
+      const u = await ensureUser(ownerId);
+      const next = computeNextReminder(u);
 
       await q(
         `UPDATE jobs
-         SET retry_count=0, last_reminded_at=NULL, next_at=$2
+         SET retry_count=0,
+             last_reminded_at=NULL,
+             next_at=$2
          WHERE owner_user_id=$1`,
         [ownerId, next.toISO()]
       );
@@ -637,21 +630,30 @@ async function workerTick() {
   }
 }
 
-async function main() {
-  await initDb();
+async function registerCommands() {
+  if (!APP_ID) {
+    console.log("APP_ID not set; skip auto register commands.");
+    console.log("You can register commands manually, or set APP_ID and redeploy.");
+    return;
+  }
 
   const rest = new REST({ version: "10" }).setToken(BOT_TOKEN);
 
-  const appId = process.env.APP_ID;
-  if (appId) {
-    await rest.put(Routes.applicationCommands(appId), { body: commands });
-    console.log("Slash commands registered.");
+  if (GUILD_ID) {
+    await rest.put(Routes.applicationGuildCommands(APP_ID, GUILD_ID), { body: commands });
+    console.log("Slash commands registered (GUILD).");
   } else {
-    console.log("APP_ID not set; skip auto register commands.");
-    console.log("You can register commands manually, or set APP_ID and redeploy.");
+    await rest.put(Routes.applicationCommands(APP_ID), { body: commands });
+    console.log("Slash commands registered (GLOBAL).");
   }
+}
 
-  client.once("clientReady", () => {
+async function main() {
+  await initDb();
+
+  await registerCommands();
+
+  client.once(Events.ClientReady, () => {
     console.log(`ALIVE bot logged in as ${client.user.tag}`);
     setInterval(() => workerTick().catch(console.error), 60 * 1000);
   });
