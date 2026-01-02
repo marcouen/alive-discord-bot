@@ -10,10 +10,9 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
-  Events,
 } = require("discord.js");
 
-const { DateTime, IANAZone } = require("luxon");
+const { DateTime } = require("luxon");
 const { nanoid } = require("nanoid");
 const { q, initDb } = require("./db");
 
@@ -21,12 +20,11 @@ const { q, initDb } = require("./db");
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN env var");
 
-const APP_ID = process.env.APP_ID || null;
-// 可選：為了讓 slash commands 立刻出現，建議設 GUILD_ID（你的測試伺服器 ID）
-const GUILD_ID = process.env.GUILD_ID || null;
+// For slash command registration
+const APP_ID = process.env.APP_ID;     // Application ID (Client ID) from Developer Portal
+const GUILD_ID = process.env.GUILD_ID; // Server ID (Guild ID) of your test server (optional)
 
 // ===== Discord client (minimal intents) =====
-// 你只需要：Guilds + DirectMessages
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
   partials: [Partials.Channel],
@@ -110,14 +108,8 @@ const commands = [
 // ===== Helpers =====
 function parseHHmm(hhmm) {
   if (!hhmm) return null;
-  const t = String(hhmm).trim();
-  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(t);
-  return m ? t : null;
-}
-
-function validTimezone(tz) {
-  if (!tz) return false;
-  return IANAZone.isValidZone(tz);
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(hhmm.trim());
+  return m ? hhmm.trim() : null;
 }
 
 function inQuietHours(dt, quietStart, quietEnd) {
@@ -133,7 +125,6 @@ function inQuietHours(dt, quietStart, quietEnd) {
 }
 
 function nextAllowedTime(dt, quietStart, quietEnd) {
-  if (!quietStart || !quietEnd) return dt;
   if (!inQuietHours(dt, quietStart, quietEnd)) return dt;
 
   const [eh, em] = quietEnd.split(":").map(Number);
@@ -161,20 +152,23 @@ function computeNextReminder(userRow) {
     if (target <= now) target = target.plus({ days: 1 });
   } else if (schedule === "weekly") {
     const [h, m] = dailyTime.split(":").map(Number);
-    // luxon weekday: 1=Mon..7=Sun ; we use 0=Sun..6=Sat
+    // luxon: weekday 1=Mon..7=Sun ; we use 0=Sun..6=Sat
     const want = weekday === 0 ? 7 : weekday;
     const today = now.weekday; // 1..7
     let diff = (want - today + 7) % 7;
-    target = now.plus({ days: diff }).set({ hour: h, minute: m, second: 0, millisecond: 0 });
+    target = now
+      .plus({ days: diff })
+      .set({ hour: h, minute: m, second: 0, millisecond: 0 });
     if (target <= now) target = target.plus({ days: 7 });
   } else {
-    // random daily: 09:00-21:00
-    const base = now.set({ hour: 9, minute: 0, second: 0, millisecond: 0 });
-    let start = base;
-    if (start <= now) start = start.plus({ days: 1 });
+    // random daily: choose random time between 09:00-21:00, avoiding quiet
+    const start = now.set({ hour: 9, minute: 0, second: 0, millisecond: 0 });
+    let base = start;
+    if (start <= now) base = start.plus({ days: 1 });
 
     const randMin = Math.floor(Math.random() * (12 * 60)); // 0..719
-    target = start.plus({ minutes: randMin });
+    target = base.plus({ minutes: randMin });
+
     target = nextAllowedTime(target, quietStart, quietEnd);
   }
 
@@ -188,6 +182,7 @@ async function ensureUser(userId) {
      ON CONFLICT (user_id) DO NOTHING`,
     [userId]
   );
+
   const { rows } = await q(`SELECT * FROM users WHERE user_id=$1`, [userId]);
   return rows[0];
 }
@@ -218,10 +213,45 @@ function reminderButtons(ownerId) {
   );
 }
 
-// ===== Interactions =====
+// ===== Command registration (NON-FATAL) =====
+async function registerCommands(rest) {
+  if (!APP_ID) {
+    console.log("APP_ID not set; skip command registration.");
+    return;
+  }
+
+  // Prefer guild commands for instant availability during testing
+  if (GUILD_ID) {
+    try {
+      await rest.put(Routes.applicationGuildCommands(APP_ID, GUILD_ID), {
+        body: commands,
+      });
+      console.log(`Slash commands registered (guild=${GUILD_ID}).`);
+    } catch (e) {
+      console.error(
+        "Slash command register failed (guild):",
+        e?.rawError || e?.message || e
+      );
+      // DO NOT crash — bot should still run
+    }
+    return;
+  }
+
+  // Fallback to global commands
+  try {
+    await rest.put(Routes.applicationCommands(APP_ID), { body: commands });
+    console.log("Slash commands registered (global).");
+  } catch (e) {
+    console.error(
+      "Slash command register failed (global):",
+      e?.rawError || e?.message || e
+    );
+  }
+}
+
+// ===== Main: interactions =====
 client.on("interactionCreate", async (interaction) => {
   try {
-    // ---- Buttons ----
     if (interaction.isButton()) {
       const [key, ownerId] = interaction.customId.split(":");
 
@@ -231,8 +261,7 @@ client.on("interactionCreate", async (interaction) => {
           [ownerId]
         );
 
-        const u = await ensureUser(ownerId);
-        const next = computeNextReminder(u);
+        const next = computeNextReminder(await ensureUser(ownerId)).toISO();
 
         await q(
           `UPDATE jobs
@@ -241,15 +270,18 @@ client.on("interactionCreate", async (interaction) => {
                last_reminded_at=NULL,
                next_at=$2
            WHERE owner_user_id=$1`,
-          [ownerId, next.toISO()]
+          [ownerId, next]
         );
 
-        await interaction.reply({ content: "✅ Check-in recorded. Thank you.", ephemeral: true });
+        await interaction.reply({
+          content: "✅ Check-in recorded. Thank you.",
+          ephemeral: true,
+        });
         return;
       }
 
       if (key === "alive_later") {
-        const next = DateTime.now().toUTC().plus({ minutes: 10 });
+        const next = DateTime.now().toUTC().plus({ minutes: 10 }).toISO();
 
         await q(
           `INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'responded','later')`,
@@ -263,30 +295,31 @@ client.on("interactionCreate", async (interaction) => {
                last_reminded_at=NULL,
                next_at=$2
            WHERE owner_user_id=$1`,
-          [ownerId, next.toISO()]
+          [ownerId, next]
         );
 
-        await interaction.reply({ content: "⏳ OK. I will ping you again in 10 minutes.", ephemeral: true });
+        await interaction.reply({
+          content: "⏳ OK. I will ping you again in 10 minutes.",
+          ephemeral: true,
+        });
         return;
       }
     }
 
-    // ---- Slash commands ----
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName !== "alive") return;
 
     const sub = interaction.options.getSubcommand();
     const userId = interaction.user.id;
 
+    // Ensure user exists
     const userRow = await ensureUser(userId);
 
     if (sub === "setup") {
       const schedule = interaction.options.getString("schedule");
       const time = parseHHmm(interaction.options.getString("time"));
       const weekday = interaction.options.getInteger("weekday");
-      const tzInput = interaction.options.getString("timezone");
-      const tz = validTimezone(tzInput) ? tzInput : (userRow.tz || "Asia/Taipei");
-
+      const tz = interaction.options.getString("timezone") || userRow.tz || "Asia/Taipei";
       const quietStart =
         parseHHmm(interaction.options.getString("quiet_start")) ||
         userRow.quiet_start ||
@@ -295,36 +328,41 @@ client.on("interactionCreate", async (interaction) => {
         parseHHmm(interaction.options.getString("quiet_end")) ||
         userRow.quiet_end ||
         "07:00";
-
       const retryGap = interaction.options.getInteger("retry_gap") || userRow.retry_gap_minutes || 30;
 
       if (!["daily", "weekly", "random"].includes(schedule)) {
-        await interaction.reply({ content: "schedule must be daily | weekly | random", ephemeral: true });
+        await interaction.reply({
+          content: "schedule must be daily | weekly | random",
+          ephemeral: true,
+        });
         return;
       }
       if ((schedule === "daily" || schedule === "weekly") && !time) {
-        await interaction.reply({ content: "For daily/weekly, you must provide time=HH:mm", ephemeral: true });
+        await interaction.reply({
+          content: "For daily/weekly, you must provide time=HH:mm",
+          ephemeral: true,
+        });
         return;
       }
       if (schedule === "weekly" && (weekday === null || weekday < 0 || weekday > 6)) {
-        await interaction.reply({ content: "For weekly, weekday must be 0..6", ephemeral: true });
+        await interaction.reply({
+          content: "For weekly, weekday must be 0..6",
+          ephemeral: true,
+        });
         return;
       }
       if (![30, 120, 1440].includes(retryGap)) {
-        await interaction.reply({ content: "retry_gap must be 30 or 120 or 1440 (minutes)", ephemeral: true });
+        await interaction.reply({
+          content: "retry_gap must be 30 or 120 or 1440 (minutes)",
+          ephemeral: true,
+        });
         return;
       }
 
       await q(
         `UPDATE users
-         SET schedule_type=$2,
-             daily_time=$3,
-             weekly_day=$4,
-             tz=$5,
-             quiet_start=$6,
-             quiet_end=$7,
-             retry_gap_minutes=$8,
-             updated_at=now()
+         SET schedule_type=$2, daily_time=$3, weekly_day=$4, tz=$5,
+             quiet_start=$6, quiet_end=$7, retry_gap_minutes=$8, updated_at=now()
          WHERE user_id=$1`,
         [userId, schedule, time, weekday, tz, quietStart, quietEnd, retryGap]
       );
@@ -361,15 +399,15 @@ client.on("interactionCreate", async (interaction) => {
         `INSERT INTO contacts(owner_user_id,contact_user_id,consent_code,consented)
          VALUES($1,$2,$3,false)
          ON CONFLICT (owner_user_id,contact_user_id)
-         DO UPDATE SET consent_code=$3, consented=false`,
+         DO UPDATE SET consent_code=$3`,
         [userId, contact.id, code]
       );
 
       await dm(contact.id, {
         content:
           "ALIVE consent request:\n" +
-          "A user wants to add you as an emergency contact.\n\n" +
-          "If you agree, run this command in ANY server where ALIVE exists:\n" +
+          `A user wants to add you as an emergency contact.\n\n` +
+          `If you agree, run this command in ANY server where ALIVE exists:\n` +
           `**/alive consent code:${code}**\n\n` +
           "If you do not agree, ignore this message.",
       });
@@ -383,17 +421,21 @@ client.on("interactionCreate", async (interaction) => {
 
     if (sub === "remove_contact") {
       const contact = interaction.options.getUser("user");
-      await q(`DELETE FROM contacts WHERE owner_user_id=$1 AND contact_user_id=$2`, [userId, contact.id]);
-      await interaction.reply({ content: `✅ Removed contact: ${contact.username}`, ephemeral: true });
+      await q(`DELETE FROM contacts WHERE owner_user_id=$1 AND contact_user_id=$2`, [
+        userId,
+        contact.id,
+      ]);
+      await interaction.reply({
+        content: `✅ Removed contact: ${contact.username}`,
+        ephemeral: true,
+      });
       return;
     }
 
     if (sub === "consent") {
       const code = interaction.options.getString("code");
-
       const { rows } = await q(
-        `UPDATE contacts
-         SET consented=true
+        `UPDATE contacts SET consented=true
          WHERE contact_user_id=$1 AND consent_code=$2
          RETURNING owner_user_id`,
         [userId, code]
@@ -403,15 +445,6 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.reply({ content: "❌ Invalid code.", ephemeral: true });
         return;
       }
-
-      const ownerId = rows[0].owner_user_id;
-
-      // DM owner: consent accepted
-      try {
-        await dm(ownerId, {
-          content: `✅ Consent accepted: <@${userId}> agreed to be your emergency contact.`,
-        });
-      } catch {}
 
       await interaction.reply({
         content: "✅ Consent recorded. You may receive alerts in the future.",
@@ -426,7 +459,6 @@ client.on("interactionCreate", async (interaction) => {
         [userId]
       );
       const consented = contacts.filter((c) => c.consented).length;
-
       if (consented === 0) {
         await interaction.reply({
           content: "⚠️ You must have at least 1 contact who has consented before starting.",
@@ -438,17 +470,20 @@ client.on("interactionCreate", async (interaction) => {
       await q(`UPDATE users SET is_active=true, updated_at=now() WHERE user_id=$1`, [userId]);
 
       const refreshed = (await q(`SELECT * FROM users WHERE user_id=$1`, [userId])).rows[0];
-      const next = computeNextReminder(refreshed);
+      const next = computeNextReminder(refreshed).toISO();
 
       await q(
-        `INSERT INTO jobs(owner_user_id,next_at,retry_count,retry_max,last_reminded_at)
-         VALUES($1,$2,0,2,NULL)
+        `INSERT INTO jobs(owner_user_id,next_at,retry_count,last_reminded_at)
+         VALUES($1,$2,0,NULL)
          ON CONFLICT (owner_user_id)
-         DO UPDATE SET next_at=$2, retry_count=0, retry_max=2, last_reminded_at=NULL`,
-        [userId, next.toISO()]
+         DO UPDATE SET next_at=$2, retry_count=0, last_reminded_at=NULL`,
+        [userId, next]
       );
 
-      await interaction.reply({ content: "✅ ALIVE started. Next check-in scheduled.", ephemeral: true });
+      await interaction.reply({
+        content: `✅ ALIVE started. Next check-in scheduled.`,
+        ephemeral: true,
+      });
       return;
     }
 
@@ -475,7 +510,9 @@ client.on("interactionCreate", async (interaction) => {
           `- quiet: ${u.quiet_start} ~ ${u.quiet_end}\n` +
           `- retry: max 2, gap ${u.retry_gap_minutes}m\n` +
           `- next: ${job ? job.next_at : "(not scheduled)"}\n` +
-          `- contacts: ${contacts.length} (consented: ${contacts.filter((c) => c.consented).length})\n`,
+          `- contacts: ${contacts.length} (consented: ${
+            contacts.filter((c) => c.consented).length
+          })\n`,
         ephemeral: true,
       });
       return;
@@ -492,7 +529,7 @@ client.on("interactionCreate", async (interaction) => {
 
 // ===== Worker loop (poll DB every 60s) =====
 async function workerTick() {
-  // 1) Scheduled reminders (only jobs not currently waiting for response)
+  // 1) Send reminders for due jobs that are NOT currently waiting for a response window
   const { rows: due } = await q(
     `SELECT j.*, u.*
      FROM jobs j
@@ -515,27 +552,27 @@ async function workerTick() {
         components: [reminderButtons(ownerId)],
       });
 
-      await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'reminded','scheduled')`, [ownerId]);
+      await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'reminded','scheduled')`, [
+        ownerId,
+      ]);
 
       const gap = row.retry_gap_minutes ?? 30;
-      const nextAt = DateTime.now().toUTC().plus({ minutes: gap });
+      const nextAt = DateTime.now().toUTC().plus({ minutes: gap }).toISO();
 
-      // mark we are waiting for response window
       await q(
         `UPDATE jobs
          SET last_reminded_at=now(),
              next_at=$2
          WHERE owner_user_id=$1`,
-        [ownerId, nextAt.toISO()]
+        [ownerId, nextAt]
       );
     } catch (e) {
-      console.error("DM failed", ownerId, e.message);
-      // keep job; will retry later
-      await q(`UPDATE jobs SET next_at=now() + interval '5 minutes' WHERE owner_user_id=$1`, [ownerId]);
+      console.error("DM failed", ownerId, e?.message || e);
+      // Keep job; will retry next tick
     }
   }
 
-  // 2) Timeouts (jobs waiting for response window)
+  // 2) Handle timeouts for jobs that ARE in a waiting window
   const { rows: pending } = await q(
     `SELECT j.*, u.*
      FROM jobs j
@@ -549,22 +586,23 @@ async function workerTick() {
   for (const row of pending) {
     const ownerId = row.owner_user_id;
 
-    // did user respond after last_reminded_at?
+    // Did user respond after last_reminded_at?
     const { rows: responded } = await q(
       `SELECT 1 FROM checkins
-       WHERE owner_user_id=$1 AND status='responded' AND created_at >= $2
+       WHERE owner_user_id=$1
+         AND status='responded'
+         AND created_at >= $2
        LIMIT 1`,
       [ownerId, row.last_reminded_at]
     );
 
     if (responded.length > 0) {
-      // button handler already scheduled next
+      // Response path already schedules next_at, so just skip
       continue;
     }
 
     const retryCount = row.retry_count ?? 0;
     const retryMax = row.retry_max ?? 2;
-    const gap = row.retry_gap_minutes ?? 30;
 
     await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'timeout',$2)`, [
       ownerId,
@@ -572,27 +610,19 @@ async function workerTick() {
     ]);
 
     if (retryCount < retryMax) {
-      // retry: send another reminder now, but keep last_reminded_at for window tracking
-      await q(`UPDATE jobs SET retry_count=retry_count+1, last_reminded_at=now(), next_at=now() + ($2 || ' minutes')::interval WHERE owner_user_id=$1`, [
-        ownerId,
-        String(gap),
-      ]);
-
-      // Actually send the retry DM now
-      try {
-        await dm(ownerId, {
-          content: "Just checking again. Please tap a button so I know you’re OK.",
-          components: [reminderButtons(ownerId)],
-        });
-        await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'reminded','retry')`, [ownerId]);
-      } catch (e) {
-        console.error("retry DM failed", ownerId, e.message);
-      }
+      // Retry: send another reminder immediately on next tick
+      await q(
+        `UPDATE jobs
+         SET retry_count=retry_count+1,
+             last_reminded_at=NULL,
+             next_at=now()
+         WHERE owner_user_id=$1`,
+        [ownerId]
+      );
     } else {
-      // escalate: notify consented contacts (simultaneous)
+      // Escalate: notify consented contacts
       const { rows: contacts } = await q(
-        `SELECT contact_user_id
-         FROM contacts
+        `SELECT contact_user_id FROM contacts
          WHERE owner_user_id=$1 AND consented=true
          LIMIT 3`,
         [ownerId]
@@ -608,15 +638,18 @@ async function workerTick() {
               "If you can, please check on them.",
           });
         } catch (e) {
-          console.error("notify contact DM failed", c.contact_user_id, e.message);
+          console.error("notify contact DM failed", c.contact_user_id, e?.message || e);
         }
       }
 
-      await q(`INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'escalated','contacts_notified')`, [ownerId]);
+      await q(
+        `INSERT INTO checkins(owner_user_id,status,note) VALUES($1,'escalated','contacts_notified')`,
+        [ownerId]
+      );
 
       // Reset and schedule next normal reminder
-      const u = await ensureUser(ownerId);
-      const next = computeNextReminder(u);
+      const userRow = await ensureUser(ownerId);
+      const next = computeNextReminder(userRow).toISO();
 
       await q(
         `UPDATE jobs
@@ -624,42 +657,19 @@ async function workerTick() {
              last_reminded_at=NULL,
              next_at=$2
          WHERE owner_user_id=$1`,
-        [ownerId, next.toISO()]
+        [ownerId, next]
       );
     }
-  }
-}
-
-async function registerCommands() {
-  if (!APP_ID) {
-    console.log("APP_ID not set; skip auto register commands.");
-    console.log("You can register commands manually, or set APP_ID and redeploy.");
-    return;
-  }
-
-  const rest = new REST({ version: "10" }).setToken(BOT_TOKEN);
-
-  if (GUILD_ID) {
-   try {
-  await rest.put(Routes.applicationGuildCommands(appId, guildId), { body: commands });
-  console.log("Slash commands registered.");
-} catch (e) {
-  console.error("Slash command register failed:", e?.rawError || e?.message || e);
-  // IMPORTANT: do NOT crash the app; bot can still run without re-registering
-}
-
-  } else {
-    await rest.put(Routes.applicationCommands(APP_ID), { body: commands });
-    console.log("Slash commands registered (GLOBAL).");
   }
 }
 
 async function main() {
   await initDb();
 
-  await registerCommands();
+  const rest = new REST({ version: "10" }).setToken(BOT_TOKEN);
+  await registerCommands(rest); // NON-FATAL
 
-  client.once(Events.ClientReady, () => {
+  client.once("clientReady", () => {
     console.log(`ALIVE bot logged in as ${client.user.tag}`);
     setInterval(() => workerTick().catch(console.error), 60 * 1000);
   });
